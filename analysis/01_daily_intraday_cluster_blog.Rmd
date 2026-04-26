@@ -345,125 +345,6 @@ ret_t = \frac{close_t}{open_{day}} - 1
 
 즉, 하루 동안 가격이 시가 대비 어떻게 전개되는지를 나타내는 누적 수익률 경로이다.
 
-다만 최근 상승장에서는 단순 누적 수익률을 사용할 경우,  
-모든 클러스터가 상승 방향으로 치우치는 문제가 발생한다.
-
-이를 보정하기 위해 하루 평균을 제거한 다음 값을 사용하였다.
-
-\[
-ret^{centered}_t = ret_t - mean(ret_t)
-\]
-
-이는 방향성보다는 “형태(shape)”에 집중하기 위한 처리이다.
-
----
-
-## Intraday Path Clustering
-
-```{r}
-path_wide |> head()
-
-```
-
-각 거래일을 하나의 벡터로 변환한 후 k-means clustering을 수행하였다. (k=4)
-
-```{r intraday_path_cluster}
-mat <- path_wide |>
-  select(-symbol, -date, -any_of("cluster")) |>
-  as.matrix() |>
-  scale()
-
-set.seed(123)
-
-fit <- kmeans(mat, centers = INTRADAY_K, nstart = 50)
-
-path_wide <- path_wide |>
-  mutate(cluster = fit$cluster)
-
-table(path_wide$cluster)
-
-
-intraday_path <- intraday_path |>
-  arrange(symbol, date, time) |>
-  group_by(symbol, date) |>
-  mutate(
-    ret_from_open = close / first(open) - 1,
-    ret_centered = ret_from_open - mean(ret_from_open, na.rm = TRUE),
-    t = row_number()
-  ) |>
-  ungroup()
-
-
-intraday_path |>
-  left_join(path_wide |> select(date, cluster), by = "date") |>
-  filter(!is.na(cluster)) |>
-  group_by(cluster, t) |>
-  summarise(
-    mean_ret = mean(ret_centered, na.rm = TRUE),
-    .groups = "drop"
-  ) |>
-  ggplot(aes(x = t, y = mean_ret, color = factor(cluster))) +
-  geom_line(linewidth = 1) +
-  labs(
-    title = "Intraday Path Clusters",
-    x = "Time Index",
-    y = "Centered Return",
-    color = "Cluster"
-  ) +
-  theme_minimal()
-
-```
-
-표에서 확인할 수 있듯이 intraday cluster별로 당일 및 다음날 성과가 상당히 다르게 나타난다.
-
-특히 \(k = 4\)로 단순화하면 각 cluster의 표본 수가 지나치게 작아지는 문제를 줄일 수 있고,  
-상승형, 하락형, 횡보형, 반전형에 가까운 큰 경로 구조를 더 안정적으로 비교할 수 있다.
-
-이 결과는 intraday path가 단순히 당일 흐름을 설명하는 것뿐 아니라,  
-이후 가격 움직임과도 일정한 관계를 가질 수 있음을 보여준다.
-
-```{r cluster_performance}
-
-cluster_summary <- intraday_path |>
-  group_by(date) |>
-  summarise(
-    day_ret = last(close) / first(open) - 1,
-    .groups = "drop"
-  ) |>
-  left_join(path_wide |> select(date, cluster), by = "date") |>
-  left_join(daily_state_tbl |> select(date, next_ret_1d), by = "date") |>
-  group_by(cluster) |>
-  summarise(
-    n = n(),
-    avg_day_ret = mean(day_ret, na.rm = TRUE),
-    win_rate_day = mean(day_ret > 0, na.rm = TRUE),
-    avg_next_ret = mean(next_ret_1d, na.rm = TRUE),
-    win_rate_next = mean(next_ret_1d > 0, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-
-cluster_summary |>
-  knitr::kable(digits = 4)
-
-
-```
-
-
-# Intraday Path Clustering 
-
-## Intraday Path 정의
-
-분단위 가격 데이터를 이용하여 각 거래일을 하나의 시계열 경로로 변환하였다.
-
-각 시점의 값은 다음과 같이 정의한다.
-
-\[
-ret_t = \frac{close_t}{open_{day}} - 1
-\]
-
-즉, 하루 동안 가격이 시가 대비 어떻게 전개되는지를 나타내는 누적 수익률 경로이다.
-
 다만 최근 상승장에서는 단순 누적 수익률을 사용할 경우, 모든 클러스터가 상승 방향으로 치우칠 수 있다. 이를 보정하기 위해 하루 평균을 제거한 값을 사용하였다.
 
 \[
@@ -575,12 +456,21 @@ cluster_summary <- intraday_path |>
   group_by(cluster) |>
   summarise(
     n = n(),
-    pct = n / sum(n),
     avg_day_ret = mean(day_ret, na.rm = TRUE),
     win_rate_day = mean(day_ret > 0, na.rm = TRUE),
     avg_next_ret = mean(next_ret_1d, na.rm = TRUE),
     win_rate_next = mean(next_ret_1d > 0, na.rm = TRUE),
     .groups = "drop"
+  ) |>
+  mutate(pct = n / sum(n)) |>
+  select(
+    cluster,
+    n,
+    pct,
+    avg_day_ret,
+    win_rate_day,
+    avg_next_ret,
+    win_rate_next
   ) |>
   arrange(cluster)
 
@@ -699,6 +589,24 @@ perf_tbl_current |>
 이 테이블의 목적은 단순히 cluster를 해석하는 것이 아니라,  
 **시장 상태(Daily State)와 장중 경로(Intraday Cluster)가 결합되었을 때  
 성과 구조가 어떻게 달라지는지를 확인하는 것**이다.
+
+```{r state-cluster-performance-table}
+perf_tbl_current |>
+  filter(n >= 10) |>
+  select(
+    state_id,
+    daily_state_label,
+    intraday_cluster,
+    intraday_cluster_label,
+    n,
+    avg_day_ret,
+    win_rate_day,
+    avg_next_ret,
+    win_rate_next
+  ) |>
+  arrange(state_id, intraday_cluster) |>
+  knitr::kable(digits = 4)
+```
 
 ---
 
