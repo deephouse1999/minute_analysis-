@@ -1,0 +1,18 @@
+# R session files
+.Rhistory
+.RData
+.Ruserdata
+
+# Raw and derived market data
+data/raw/
+data/derived/
+*.rds
+
+# Local/editor files
+.Rproj.user/
+.vscode/
+.idea/
+
+# OS files
+Thumbs.db
+.DS_Store

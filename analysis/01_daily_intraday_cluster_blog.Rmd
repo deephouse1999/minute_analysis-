@@ -1,0 +1,743 @@
+---
+title: "Daily OHLC State와 Intraday Path Cluster를 이용한 KOSPI200 ETF 시장 구조 분석"
+author: "JeongHwan Yoon"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(knitr)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+BASE_DIR <- "C:/app/hts/minute_analysis"
+DERIVED_DIR <- file.path(BASE_DIR, "data", "derived")
+FIGURE_DIR <- file.path(BASE_DIR, "output", "figures")
+TABLE_DIR <- file.path(BASE_DIR, "output", "tables")
+INTRADAY_K <- 4
+```
+
+# 분석 목적
+
+본 분석의 목적은 KOSPI200 ETF 시장에서 반복적으로 나타나는 가격 움직임의 구조를 정량적으로 기술하는 데 있다.
+
+일반적인 기술적 분석이 개별 패턴이나 지표에 의존하는 것과 달리, 본 분석에서는 가격 데이터를 기반으로 시장 상태를 데이터 중심으로 정의하고자 한다.
+
+이를 위해 분석은 다음 두 단계로 구성된다.
+
+1. 일봉 OHLC 데이터를 이용하여 시장의 일별 상태(Daily State)를 정의한다  
+2. 분단위 가격 경로를 이용하여 장중 가격 흐름(Intraday Path)을 클러스터링한다  
+
+궁극적으로 확인하고자 하는 질문은 다음과 같다.
+
+> 특정한 Daily State가 발생했을 때, 과거에는 어떤 Intraday Path가 주로 동반되었는가?
+
+즉, 본 분석은 "방향 예측"이 아니라  
+**시장 상태(state)와 장중 경로(path) 사이의 구조적 관계를 기술하는 것**에 초점을 둔다.
+
+본 단계에서는 예측모델을 바로 구축하기보다는,  
+Daily State와 Intraday Cluster 간의 관계가 충분히 안정적이고 의미 있는지 확인하여,  
+향후 모델링 및 트레이딩 룰 설계가 가능한지를 판단하는 것을 목표로 한다.
+
+---
+
+# 데이터
+
+본 분석에서는 KOSPI200 ETF를 대상으로 일봉 및 분단위 가격 데이터를 활용하였다.
+
+분석 대상 자산은 다음과 같다.
+
+- KODEX 레버리지 ETF (122630)
+- KODEX 인버스 2X ETF (252670)
+
+일봉 데이터는 Yahoo Finance를 통해 수집하였으며,  
+분단위 데이터는 KIS Open API를 이용하여 과거 분봉 조회 방식으로 확보하였다.
+
+분단위 데이터는 다음과 같은 특징을 가진다.
+
+- 1분 단위 OHLC 구조  
+- 장 시작(09:00)부터 장 종료(15:30)까지의 가격 경로  
+- 최대 1년 범위의 과거 데이터 확보 가능  
+
+데이터는 다음 두 가지 형태로 가공하여 사용하였다.
+
+1. **Daily Dataset**  
+   - 일봉 OHLC 기반 feature 생성  
+   - Daily State 정의에 사용  
+
+2. **Intraday Dataset**  
+   - 분단위 가격 경로를 하루 단위 시계열로 변환  
+   - Intraday Path Clustering에 사용  
+
+특히 Intraday 데이터는 하루를 하나의 시계열로 간주하여 다음과 같이 정의하였다.
+
+\[
+ret_t = \frac{close_t}{open_{day}} - 1
+\]
+
+이는 하루 동안 가격이 시가 대비 어떻게 전개되었는지를 나타내는 누적 수익률 경로이다.
+
+또한 최근 상승장 편향을 제거하기 위해,  
+클러스터링에는 하루 평균을 제거한 정규화된 경로를 사용하였다.
+
+## 데이터 로드
+
+```{r data}
+daily_state_tbl <- readRDS(file.path(DERIVED_DIR, "daily_state_tbl.rds"))
+state_summary <- read_csv(file.path(DERIVED_DIR, "daily_state_summary.csv"))
+
+path_wide_raw <- readRDS(file.path(DERIVED_DIR, "intraday_path_wide_122630_ret_centered.rds"))
+intraday_path <- readRDS(file.path(DERIVED_DIR, "intraday_path_features_122630.rds"))
+intraday_day_summary <- readRDS(file.path(DERIVED_DIR, "intraday_day_summary_122630.rds"))
+
+final_tbl <- readRDS(file.path(DERIVED_DIR, "daily_state_intraday_cluster_tbl.rds"))
+dist_tbl <- readRDS(file.path(DERIVED_DIR, "daily_state_intraday_dist_tbl.rds"))
+perf_tbl <- readRDS(file.path(DERIVED_DIR, "daily_state_intraday_perf_tbl.rds"))
+trade_implication_tbl <- readRDS(file.path(DERIVED_DIR, "daily_state_intraday_trade_implication_tbl.rds"))
+
+daily_state_tbl <- daily_state_tbl |>
+  mutate(date = gsub("-", "", as.character(date)))
+
+path_wide_raw <- path_wide_raw |>
+  mutate(date = as.character(date))
+
+intraday_path <- intraday_path |>
+  mutate(date = as.character(date))
+
+mat <- path_wide_raw |>
+  select(-symbol, -date) |>
+  as.matrix() |>
+  scale()
+
+set.seed(123)
+
+fit <- kmeans(mat, centers = INTRADAY_K, nstart = 50)
+
+path_wide <- path_wide_raw |>
+  mutate(cluster = fit$cluster)
+
+intraday_cluster_tbl <- path_wide |>
+  select(symbol, date, intraday_cluster = cluster)
+
+tibble(
+  daily_state_n = nrow(daily_state_tbl),
+  intraday_cluster_n = nrow(intraday_cluster_tbl),
+  matched_n = nrow(final_tbl),
+  matched_start = min(final_tbl$date, na.rm = TRUE),
+  matched_end = max(final_tbl$date, na.rm = TRUE)
+) |>
+  kable()
+
+```
+
+## 데이터 개요
+
+본 분석에서는 일봉과 분봉 데이터가 모두 존재하는 구간만을 대상으로 결합 분석을 수행하였다.
+
+```{r data_descrip}
+tibble(
+  daily_state_n = nrow(daily_state_tbl),
+  intraday_cluster_n = nrow(intraday_cluster_tbl),
+  matched_n = nrow(final_tbl),
+  matched_start = min(final_tbl$date, na.rm = TRUE),
+  matched_end = max(final_tbl$date, na.rm = TRUE)
+) |>
+  knitr::kable()
+
+
+```
+
+
+
+#  Daily OHLC State
+
+## 접근 방식
+
+일봉 OHLC 데이터는 단순히 상승/하락 여부를 나타내는 것이 아니라,  
+해당 거래일의 가격 구조와 변동성 정보를 동시에 포함하고 있다.
+
+본 분석에서는 다음과 같은 feature를 활용하여 Daily State를 정의하였다.
+
+- 종가 기준 수익률 (Close-to-Close Return)
+- 시가 대비 종가 수익률 (Open-to-Close Return)
+- 갭 수익률 (Gap Return)
+- 장중 가격 범위 (Range)
+- 캔들 body 비율 (Body Ratio)
+- 종가 위치 (Close Location)
+- 단기/중기 변동성 (5일, 20일)
+- 이동평균 대비 괴리율
+
+이러한 feature는 단순 방향성뿐 아니라,  
+“어떤 형태의 하루였는가”를 정량적으로 표현하기 위한 것이다.
+
+---
+
+## Clustering 결과
+
+위 feature를 기반으로 k-means clustering을 수행하여  
+일봉 데이터를 4개의 상태로 구분하였다.
+
+
+```{r daily_state_tbl}
+daily_state_summary_full <- daily_state_tbl |>
+  group_by(state_id) |>
+  summarise(
+    n = n(),
+    pct = n / sum(n),
+    
+    avg_ret_cc = mean(ret_cc_1d, na.rm = TRUE),
+    avg_next_ret = mean(next_ret_1d, na.rm = TRUE),
+    win_rate_next = mean(next_ret_1d > 0, na.rm = TRUE),
+    
+    avg_range = mean(range, na.rm = TRUE),
+    avg_vol_20d = mean(vol_20d, na.rm = TRUE),
+    avg_close_location = mean(close_location, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+
+daily_state_summary_full <- daily_state_summary_full |>
+  mutate(
+    state_label = case_when(
+      state_id == 1 ~ "Mild Trend Up",
+      state_id == 2 ~ "Weak Pullback / Neutral",
+      state_id == 3 ~ "Strong Momentum Up",
+      state_id == 4 ~ "Oversold Rebound"
+    )
+  ) |>
+  select(
+    state_id,
+    state_label,
+    n,
+    pct,
+    avg_ret_cc,
+    avg_next_ret,
+    win_rate_next,
+    avg_range,
+    avg_vol_20d,
+    avg_close_location
+  )
+
+daily_state_summary_full |>
+  knitr::kable(digits = 3)
+
+```
+
+위 표는 각 Daily State의 발생 빈도와 성과를 동시에 보여준다.
+
+대부분의 거래일은 State 1과 State 2에 해당하며,  
+State 3과 State 4는 상대적으로 드물게 나타난다.
+
+그러나 중요한 점은 다음과 같다.
+
+- State 3과 State 4는 발생 빈도는 낮지만,  
+  평균 수익률과 승률이 상대적으로 높다.
+
+- 반면 State 1과 State 2는 빈도는 높지만,  
+  트레이딩 관점에서는 의미 있는 edge가 제한적이다.
+
+이는 시장이 대부분 “평범한 상태”에 머물지만,  
+실제 수익 기회는 “극단 상태”에서 발생한다는 구조를 시사한다.
+
+
+## State별 다음날 수익률 분포
+
+```{r daily_state_tbl_plot}
+library(ggplot2)
+
+ggplot(daily_state_tbl, aes(x = factor(state_id), y = next_ret_1d)) +
+  geom_boxplot(fill = "skyblue") +
+  labs(
+    title = "Next-day Return Distribution by Daily State",
+    x = "State",
+    y = "Next-day Return"
+  ) +
+  theme_minimal()
+
+```
+
+## State별 평균 수익률 및 승률
+
+State 3과 State 4에서 평균 수익률과 승률이 상대적으로 높고 State 1과 State 2는 통계적으로 의미 있는 차이가 거의 없다
+
+```{r state_avg_rtn}
+daily_state_tbl |>
+  group_by(state_id) |>
+  summarise(
+    avg_next_ret = mean(next_ret_1d, na.rm = TRUE),
+    win_rate = mean(next_ret_1d > 0, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  knitr::kable(digits = 4)
+
+```
+
+---
+
+## 한계
+
+다만 Daily State만으로는 다음과 같은 한계가 존재한다.
+
+- 동일한 state 내에서도 장중 가격 경로는 크게 달라질 수 있음
+- intraday 변동성 및 구조를 반영하지 못함
+- 실제 트레이딩 타이밍을 결정하기에는 정보가 부족함
+
+따라서 Daily State는 단독으로 사용하기보다는,  
+Intraday Path와 결합하여 해석할 필요가 있다.
+
+
+# Intraday Path Clustering 
+
+## Intraday Path 정의
+
+분단위 가격 데이터를 이용하여 각 거래일을 하나의 시계열 경로로 변환하였다.
+
+각 시점의 값은 다음과 같이 정의한다.
+
+\[
+ret_t = \frac{close_t}{open_{day}} - 1
+\]
+
+즉, 하루 동안 가격이 시가 대비 어떻게 전개되는지를 나타내는 누적 수익률 경로이다.
+
+다만 최근 상승장에서는 단순 누적 수익률을 사용할 경우,  
+모든 클러스터가 상승 방향으로 치우치는 문제가 발생한다.
+
+이를 보정하기 위해 하루 평균을 제거한 다음 값을 사용하였다.
+
+\[
+ret^{centered}_t = ret_t - mean(ret_t)
+\]
+
+이는 방향성보다는 “형태(shape)”에 집중하기 위한 처리이다.
+
+---
+
+## Intraday Path Clustering
+
+```{r}
+path_wide |> head()
+
+```
+
+각 거래일을 하나의 벡터로 변환한 후 k-means clustering을 수행하였다. (k=4)
+
+```{r intraday_path_cluster}
+mat <- path_wide |>
+  select(-symbol, -date, -any_of("cluster")) |>
+  as.matrix() |>
+  scale()
+
+set.seed(123)
+
+fit <- kmeans(mat, centers = INTRADAY_K, nstart = 50)
+
+path_wide <- path_wide |>
+  mutate(cluster = fit$cluster)
+
+table(path_wide$cluster)
+
+
+intraday_path <- intraday_path |>
+  arrange(symbol, date, time) |>
+  group_by(symbol, date) |>
+  mutate(
+    ret_from_open = close / first(open) - 1,
+    ret_centered = ret_from_open - mean(ret_from_open, na.rm = TRUE),
+    t = row_number()
+  ) |>
+  ungroup()
+
+
+intraday_path |>
+  left_join(path_wide |> select(date, cluster), by = "date") |>
+  filter(!is.na(cluster)) |>
+  group_by(cluster, t) |>
+  summarise(
+    mean_ret = mean(ret_centered, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  ggplot(aes(x = t, y = mean_ret, color = factor(cluster))) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Intraday Path Clusters",
+    x = "Time Index",
+    y = "Centered Return",
+    color = "Cluster"
+  ) +
+  theme_minimal()
+
+```
+
+표에서 확인할 수 있듯이 intraday cluster별로 당일 및 다음날 성과가 상당히 다르게 나타난다.
+
+특히 \(k = 4\)로 단순화하면 각 cluster의 표본 수가 지나치게 작아지는 문제를 줄일 수 있고,  
+상승형, 하락형, 횡보형, 반전형에 가까운 큰 경로 구조를 더 안정적으로 비교할 수 있다.
+
+이 결과는 intraday path가 단순히 당일 흐름을 설명하는 것뿐 아니라,  
+이후 가격 움직임과도 일정한 관계를 가질 수 있음을 보여준다.
+
+```{r cluster_performance}
+
+cluster_summary <- intraday_path |>
+  group_by(date) |>
+  summarise(
+    day_ret = last(close) / first(open) - 1,
+    .groups = "drop"
+  ) |>
+  left_join(path_wide |> select(date, cluster), by = "date") |>
+  left_join(daily_state_tbl |> select(date, next_ret_1d), by = "date") |>
+  group_by(cluster) |>
+  summarise(
+    n = n(),
+    avg_day_ret = mean(day_ret, na.rm = TRUE),
+    win_rate_day = mean(day_ret > 0, na.rm = TRUE),
+    avg_next_ret = mean(next_ret_1d, na.rm = TRUE),
+    win_rate_next = mean(next_ret_1d > 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+cluster_summary |>
+  knitr::kable(digits = 4)
+
+
+```
+
+
+# Intraday Path Clustering 
+
+## Intraday Path 정의
+
+분단위 가격 데이터를 이용하여 각 거래일을 하나의 시계열 경로로 변환하였다.
+
+각 시점의 값은 다음과 같이 정의한다.
+
+\[
+ret_t = \frac{close_t}{open_{day}} - 1
+\]
+
+즉, 하루 동안 가격이 시가 대비 어떻게 전개되는지를 나타내는 누적 수익률 경로이다.
+
+다만 최근 상승장에서는 단순 누적 수익률을 사용할 경우, 모든 클러스터가 상승 방향으로 치우칠 수 있다. 이를 보정하기 위해 하루 평균을 제거한 값을 사용하였다.
+
+\[
+ret^{centered}_t = ret_t - mean(ret_t)
+\]
+
+이는 방향성보다는 장중 경로의 **형태(shape)** 에 집중하기 위한 처리이다.
+
+---
+
+## Intraday Path Clustering
+
+각 거래일 분봉데이터를 하나의 벡터로 변환한 후 k-means clustering을 수행하였다. 여기서는 해석 안정성과 표본 수를 고려하여 \(k = 4\)를 사용하였다.
+
+```{r intraday_path_cluster_make}
+mat <- path_wide |>
+  select(-symbol, -date, -any_of("cluster")) |>
+  as.matrix() |>
+  scale()
+
+set.seed(123)
+
+fit <- kmeans(mat, centers = INTRADAY_K, nstart = 50)
+
+path_wide <- path_wide |>
+  mutate(cluster = fit$cluster)
+
+intraday_path <- intraday_path |>
+  arrange(symbol, date, time) |>
+  group_by(symbol, date) |>
+  mutate(
+    ret_from_open = close / first(open) - 1,
+    ret_centered = ret_from_open - mean(ret_from_open, na.rm = TRUE),
+    t = row_number()
+  ) |>
+  ungroup()
+
+path_wide |>
+  count(cluster) |>
+  mutate(pct = n / sum(n)) |>
+  knitr::kable(digits = 3)
+
+```
+
+아래 그림은 각 cluster의 평균 intraday path를 보여준다. Cluster별로 상승 추세형, 하락 추세형, 횡보형, 반등형에 가까운 서로 다른 장중 구조가 관찰된다.
+
+```{r  intraday_grph}
+
+intraday_path |>
+  left_join(path_wide |> select(date, cluster), by = "date") |>
+  filter(!is.na(cluster)) |>
+  group_by(cluster, t) |>
+  summarise(
+    mean_ret = mean(ret_centered, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  ggplot(aes(x = t, y = mean_ret, color = factor(cluster))) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Intraday Path Clusters",
+    x = "Time Index",
+    y = "Centered Return",
+    color = "Cluster"
+  ) +
+  theme_minimal()
+
+```
+
+## Intraday Cluster별 성과
+
+아래 표는 intraday cluster별로 당일 및 다음날 성과를 정리한 것이다.
+
+각 행은 특정 intraday cluster에 속하는 거래일들을 모아 계산된 결과이며,  
+다음과 같은 기준으로 지표를 구성하였다.
+
+- `n`: 해당 cluster에 속한 거래일 수  
+- `pct`: 전체 거래일 대비 해당 cluster의 비중  
+
+- `avg_day_ret`: 해당 cluster가 발생한 날의 평균 수익률  
+- `win_rate_day`: 해당 cluster 발생일 중 당일 수익률이 양(+)인 비율  
+
+- `avg_next_ret`: 해당 cluster가 발생한 다음날의 평균 수익률  
+- `win_rate_next`: 해당 cluster 발생일 기준 다음날 수익률이 양(+)인 비율  
+
+이 테이블은 intraday path 자체의 형태를 해석하기 위한 것이 아니라,  
+각 cluster가 **당일 및 이후 수익 구조와 어떤 관계를 가지는지**를 확인하기 위한 것이다.
+
+특히, 당일 수익률(`avg_day_ret`)과 다음날 수익률(`avg_next_ret`)을 함께 비교함으로써,  
+각 intraday 패턴이 단기적인 추세 지속인지, 혹은 반전(reversal) 구조를 가지는지를  
+간접적으로 확인할 수 있다.
+
+또한 `win_rate`는 평균값만으로는 확인하기 어려운 분포 특성을 보완하기 위한 지표로,  
+특정 cluster가 통계적으로 일관된 방향성을 가지는지를 판단하는 데 활용된다.
+
+다만 일부 cluster는 표본 수(`n`)가 충분하지 않을 수 있으므로,  
+해석 시에는 최소 표본 수 기준을 함께 고려하는 것이 필요하다.
+
+
+```{r intraday_cluter_perfom}
+
+cluster_summary <- intraday_path |>
+  group_by(date) |>
+  summarise(
+    day_ret = last(close) / first(open) - 1,
+    .groups = "drop"
+  ) |>
+  left_join(path_wide |> select(date, cluster), by = "date") |>
+  left_join(daily_state_tbl |> select(date, next_ret_1d), by = "date") |>
+  group_by(cluster) |>
+  summarise(
+    n = n(),
+    pct = n / sum(n),
+    avg_day_ret = mean(day_ret, na.rm = TRUE),
+    win_rate_day = mean(day_ret > 0, na.rm = TRUE),
+    avg_next_ret = mean(next_ret_1d, na.rm = TRUE),
+    win_rate_next = mean(next_ret_1d > 0, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(cluster)
+
+cluster_summary |>
+  knitr::kable(digits = 4)
+  
+```
+
+
+# Daily State × Intraday Cluster
+
+## 결합 데이터
+
+Daily State와 Intraday Cluster를 `date` 기준으로 결합하였다.  
+이 결합 데이터는 특정 일봉 상태에서 어떤 장중 경로가 나타났는지를 확인하기 위한 기본 테이블이다.
+
+```{r joined_data_preview}
+
+
+### Rmd 내부에서 현재 path_wide$cluster 기준으로 재생성
+
+daily_state_current <- daily_state_tbl |>
+  mutate(
+    date = gsub("-", "", as.character(date))
+  )
+
+intraday_cluster_current <- path_wide |>
+  select(date, cluster) |>
+  mutate(
+    date = gsub("-", "", as.character(date)),
+    intraday_cluster = cluster
+  ) |>
+  select(date, intraday_cluster)
+
+final_tbl_current <- daily_state_current |>
+  inner_join(intraday_cluster_current, by = "date")
+
+dist_tbl_current <- final_tbl_current |>
+  count(state_id, intraday_cluster, name = "n") |>
+  group_by(state_id) |>
+  mutate(
+    prob = n / sum(n)
+  ) |>
+  ungroup()
+
+perf_tbl_current <- final_tbl_current |>
+  group_by(state_id, intraday_cluster) |>
+  summarise(
+    n = n(),
+    avg_next_ret = mean(next_ret_1d, na.rm = TRUE),
+    median_next_ret = median(next_ret_1d, na.rm = TRUE),
+    win_rate_next = mean(next_ret_1d > 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+final_tbl_current |>
+  select(date, state_id, intraday_cluster, next_ret_1d) |>
+  head() |>
+  knitr::kable(digits = 4)
+
+```
+
+## 조건부 분포
+
+다음으로 State × Cluster 조합별 다음날 수익률과 승률을 확인한다. 표본 수가 너무 작은 조합은 해석의 안정성이 낮으므로, 여기서는 n >= 10인 조합만 별도로 표시하였다.
+
+
+
+```{r state_cluster_return_heatmap, fig.width=8, fig.height=5}
+
+perf_tbl_current |>
+  filter(n >= 10) |>
+  ggplot(aes(
+    x = factor(intraday_cluster),
+    y = factor(state_id),
+    fill = avg_next_ret
+  )) +
+  geom_tile(color = "white") +
+  geom_text(
+    aes(label = paste0(
+      "n=", n, "\n",
+      sprintf("%.2f%%", avg_next_ret * 100)
+    )),
+    size = 3
+  ) +
+  scale_fill_gradient2(
+    low = "steelblue",
+    mid = "white",
+    high = "firebrick",
+    midpoint = 0
+  ) +
+  labs(
+    title = "Next-day Return by Daily State × Intraday Cluster",
+    subtitle = "Cell label = sample size and average next-day return",
+    x = "Intraday Cluster",
+    y = "Daily State",
+    fill = "Avg next return"
+  ) +
+  theme_minimal()
+
+
+```
+## State × Cluster 성과 테이블
+
+위 Heatmap은 Daily State와 Intraday Cluster를 결합하여,  
+각 조합별  다음날 성과를 정리한 것이다.
+
+각 행은 특정 `(state, intraday cluster)` 조합에 해당하는 거래일들을 모아 계산된 결과이며,  
+지표는 다음과 같은 기준으로 구성하였다.
+
+- `n`: 해당 조합에 속한 거래일 수  
+
+- `avg_next_ret`: 해당 조합에서 다음날 평균 수익률  
+- `win_rate_next`: 해당 조합에서 다음날 수익률이 양(+)인 비율  
+
+이 테이블의 목적은 단순히 cluster를 해석하는 것이 아니라,  
+**시장 상태(Daily State)와 장중 경로(Intraday Cluster)가 결합되었을 때  
+성과 구조가 어떻게 달라지는지를 확인하는 것**이다.
+
+---
+
+## 해석 방법
+
+이 테이블은 다음과 같은 방식으로 해석할 수 있다.
+
+첫째, 동일한 Daily State 내에서도 Intraday Cluster에 따라  
+다음날 성과가 어떻게 달라지는지를 확인한다.
+
+둘째, 특정 Intraday Cluster가 여러 State에서 일관된 성과를 가지는지를 확인한다.
+
+셋째, 특정 `(state, cluster)` 조합에서만 나타나는 성과 구조가 존재하는지를 확인한다.
+
+---
+
+## 분석 관점
+
+이 결과는 단일 변수 기반 분석의 한계를 보완한다.
+
+- Daily State는 시장의 **환경(context)** 을 정의한다.
+- Intraday Cluster는 해당 환경 내에서의 **경로(path)** 를 정의한다.
+
+따라서, 개별 변수만으로는 확인하기 어려운 구조가  
+두 변수의 결합을 통해 드러날 수 있다.
+
+특히 다음과 같은 구조를 확인하는 것이 중요하다.
+
+- 특정 state에서만 의미 있는 cluster  
+- 특정 cluster에서만 나타나는 성과 패턴  
+- 두 조건이 동시에 만족될 때 강화되는 신호  
+
+---
+
+## 주의사항
+
+이 테이블은 조합 단위로 데이터를 분할하기 때문에,  
+일부 `(state, cluster)` 조합은 표본 수(`n`)가 매우 작을 수 있다.
+
+따라서 해석 시에는 다음 기준을 함께 고려해야 한다.
+
+- 최소 표본 수 기준 (예: n ≥ 10)
+- 평균값과 승률의 동시 확인
+- 극단값(outlier)에 대한 영향 가능성
+
+즉, 이 테이블은 특정 전략을 확정하기 위한 결과라기보다,  
+**추가적인 검증이 필요한 후보 신호를 탐색하는 단계**로 이해하는 것이 적절하다.
+
+
+
+# 핵심 결론
+
+위 결과를 종합하면 다음과 같이 정리할 수 있다.
+
+  - Daily State는 시장의 환경(context) 을 정의한다.
+  - Intraday Cluster는 해당 환경 내에서의 경로(path) 를 정의한다.
+  -실제 트레이딩 신호는 두 요소의 결합에서 나타난다.
+
+즉, Daily State는 context, Intraday Cluster는 trigger로 해석하는 것이 가장 자연스럽다.
+
+# 시사점
+
+본 분석은 단순한 방향 예측을 넘어, 시장 구조를 계층적으로 이해할 필요가 있음을 보여준다.
+
+  - Daily State → 상위 레벨 구조
+  - Intraday Path → 하위 레벨 구조
+
+향후 트레이딩 전략은 다음과 같은 형태로 확장될 수 있다.
+
+  - 특정 State에서만 거래 수행
+  - 특정 Intraday Cluster에서만 진입
+  - 두 조건이 동시에 만족될 때 포지션 확대
+
+# 한계
