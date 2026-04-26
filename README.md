@@ -6,7 +6,7 @@ Daily OHLC state and intraday path clustering analysis for KOSPI200 ETF market s
 
 **[Open the HTML article](https://deephouse1999.github.io/minute_analysis-/)**
 
-![Daily state and intraday cluster heatmap](output/figures/heatmap_daily_state_intraday_next_return.png)
+![Daily state transition matrix](output/figures/daily_state_transition_matrix.png)
 
 ## Article
 
