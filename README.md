@@ -4,12 +4,14 @@ Daily OHLC state and intraday path clustering analysis for KOSPI200 ETF market s
 
 ## Article
 
-- [Rendered HTML article](analysis/01_daily_intraday_cluster_blog.html)
+- [HTML article for GitHub Pages](docs/index.html)
+- [Rendered HTML article backup](analysis/01_daily_intraday_cluster_blog.html)
 - [R Markdown source](analysis/01_daily_intraday_cluster_blog.Rmd)
 
 ## Repository Structure
 
 - `analysis/`: R Markdown article and rendered HTML output
+- `docs/`: GitHub Pages entry point for the rendered HTML article
 - `r/`: data preparation and clustering scripts
 - `output/figures/`: generated analysis figures
 - `output/tables/`: generated summary tables
